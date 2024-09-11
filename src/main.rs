@@ -1,13 +1,14 @@
+mod midi;
+
 use std::error::Error;
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints, Legend};
+use egui_plot::{Line, Plot, PlotPoints, Legend, PlotBounds};
 use futures::stream::StreamExt;
 use thiserror::Error;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use std::io::{stdin, stdout, Write};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -15,8 +16,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(0x64696c640000100080000000cafebabe);
 const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69630000100080000000cafebabe);
-const MAX_POINTS: usize = 100;
-const RUNNING_AVERAGE_WINDOW: usize = 2; // Number of samples to use for running average
+const MAX_POINTS: usize = 1000;
+const RUNNING_AVERAGE_WINDOW: usize = 1000; // Number of samples to use for running average
 
 
 #[derive(Error, Debug)]
@@ -85,14 +86,14 @@ impl RunningAverage {
 }
 
 struct PlotApp {
-    sensor_data: Arc<Mutex<BTreeMap<u32, Vec<[f64; 2]>>>>, // Changed to Vec<[f64; 2]>
+    sensor_data: Arc<Mutex<BTreeMap<u32, Vec<[f64; 2]>>>>,
     running_averages: Arc<Mutex<BTreeMap<u32, RunningAverage>>>,
     rx: mpsc::Receiver<Sample>,
 }
 
 impl PlotApp {
     fn new(
-        sensor_data: Arc<Mutex<BTreeMap<u32, Vec<[f64; 2]>>>>, // Changed to Vec<[f64; 2]>
+        sensor_data: Arc<Mutex<BTreeMap<u32, Vec<[f64; 2]>>>>,
         running_averages: Arc<Mutex<BTreeMap<u32, RunningAverage>>>,
         rx: mpsc::Receiver<Sample>,
     ) -> Self {
@@ -122,8 +123,10 @@ impl eframe::App for PlotApp {
                 0.0
             };
 
+            //println!("{}, {}", sample.timestamp , sample.value);
+
             let zone_data = sensor_data.entry(sample.zone).or_insert_with(Vec::new);
-            zone_data.push([sample.timestamp as f64, normalized_value]); // Changed to [f64; 2]
+            zone_data.push([sample.timestamp as f64, sample.value as f64]);
 
             if zone_data.len() > MAX_POINTS {
                 zone_data.remove(0);
@@ -135,11 +138,16 @@ impl eframe::App for PlotApp {
 
             Plot::new("sensor_plot")
                 .legend(Legend::default())
+                // uv .allow_drag(false)
+                //.allow_zoom(false)
+                .allow_scroll(false)
                 .show(ui, |plot_ui| {
                     for (zone, points) in sensor_data.iter() {
                         let plot_points = PlotPoints::new(points.clone()); // Simplified: PlotPoints can be created directly from Vec<[f64; 2]>
                         plot_ui.line(Line::new(plot_points).name(format!("Zone {}", zone)));
                     }
+                    //plot_ui.set_plot_bounds(PlotBounds::from_min_max([0., 1.], [0., 100000.]));
+                    //plot_ui.set_auto_bounds([true, false].into());
                 });
         });
 
@@ -149,6 +157,8 @@ impl eframe::App for PlotApp {
 
 #[tokio::main]
 async fn main() -> Result<(), SampleError> {
+    let midi_conn = midi::create_midi_device().expect("Could not create MIDI device");
+
     let sensor_data = Arc::new(Mutex::new(BTreeMap::new()));
     let running_averages = Arc::new(Mutex::new(BTreeMap::new()));
     let (tx, mut rx) = mpsc::channel(100);
@@ -188,10 +198,11 @@ async fn main() -> Result<(), SampleError> {
 
             let mut notification_stream = device.notifications().await.unwrap();
             println!("Listening for notifications...");
+
             while let Some(data) = notification_stream.next().await {
                 match Sample::from_bytes(&data.value) {
-                    Ok(sensor_data) => {
-                        tx.send(sensor_data).await.unwrap();
+                    Ok(sample) => {
+                        tx.send(sample).await.unwrap();
                     }
                     Err(e) => eprintln!("Error parsing sensor data: {}", e)
                 };
