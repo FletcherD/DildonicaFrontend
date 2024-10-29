@@ -1,8 +1,6 @@
 use std::error::Error;
 use std::io::{stdin, stdout, Write};
 use midir::{MidiOutput, MidiOutputConnection, MidiOutputPort};
-use std::thread;
-use std::time::Duration;
 
 pub fn create_midi_device() -> Result<MidiOutputConnection, Box<dyn Error>> {
     let midi_out = MidiOutput::new("My Virtual MIDI Device")?;
@@ -36,10 +34,9 @@ pub fn create_midi_device() -> Result<MidiOutputConnection, Box<dyn Error>> {
     Ok(conn_out)
 }
 
-fn send_control_change(mut conn_out: MidiOutputConnection, control_num: u8, control_value: u8) -> Result<(), Box<dyn Error>> {
+pub fn send_control_change(conn_out: &mut MidiOutputConnection, control_num: u8, control_value: u8) -> Result<(), Box<dyn Error>> {
     const CC_MSG: u8 = 0xB0;
 
-    println!("Playing note...");
     conn_out.send(&[CC_MSG, control_num, control_value])?;
 
     Ok(())

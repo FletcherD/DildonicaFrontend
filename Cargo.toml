@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+num-traits = "0.2"
 btleplug = "0.10"
 tokio = { version = "1", features = ["full"] }
 uuid = "1.3"

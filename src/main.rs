@@ -1,6 +1,7 @@
 mod midi;
+mod exponential_average;
 
-use std::error::Error;
+use std::cmp::min;
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
 use eframe::egui;
@@ -9,21 +10,25 @@ use futures::stream::StreamExt;
 use thiserror::Error;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::io::{stdin, stdout, Write};
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap};
+use std::error::Error;
+use midir::MidiOutputConnection;
+use num_traits::abs;
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(0x64696c640000100080000000cafebabe);
 const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69630000100080000000cafebabe);
-const MAX_POINTS: usize = 1000;
-const RUNNING_AVERAGE_WINDOW: usize = 1000; // Number of samples to use for running average
-
+const MAX_POINTS: usize = 100;
+const NUM_ZONES: usize = 8;
+const EXPONENTIAL_ALPHA: f64 = 0.001;
 
 #[derive(Error, Debug)]
 enum SampleError {
     #[error("Data too short")]
     DataTooShort,
+    #[error("Invalid zone")]
+    InvalidZone,
     #[error("BLE error: {0}")]
     BleError(#[from] btleplug::Error),
 }
@@ -31,13 +36,13 @@ enum SampleError {
 #[derive(Clone, Copy)]
 struct Sample {
     timestamp: u32,
-    value: u32,
+    value: Option<u32>,
     zone: u32,
 }
 
 impl Sample {
     fn from_bytes(data: &[u8]) -> Result<Self, SampleError> {
-        if data.len() < 6 {
+        if data.len() < 12 {
             return Err(SampleError::DataTooShort);
         }
 
@@ -45,62 +50,38 @@ impl Sample {
         let value = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let zone = u32::from_le_bytes(data[8..12].try_into().unwrap());
 
+        if zone >= NUM_ZONES as u32 {
+            return Err(SampleError::InvalidZone);
+        }
+
         Ok(Sample {
             timestamp,
-            value,
+            value: if value == 0 { None } else { Some(value) },
             zone,
         })
     }
 }
 
 
-struct RunningAverage {
-    values: VecDeque<f64>,
-    sum: f64,
-}
-
-impl RunningAverage {
-    fn new() -> Self {
-        RunningAverage {
-            values: VecDeque::with_capacity(RUNNING_AVERAGE_WINDOW),
-            sum: 0.0,
-        }
-    }
-
-    fn add(&mut self, value: f64) -> f64 {
-        if self.values.len() == RUNNING_AVERAGE_WINDOW {
-            self.sum -= self.values.pop_front().unwrap();
-        }
-        self.values.push_back(value);
-        self.sum += value;
-        self.average()
-    }
-
-    fn average(&self) -> f64 {
-        if self.values.is_empty() {
-            0.0
-        } else {
-            self.sum / self.values.len() as f64
-        }
-    }
-}
-
 struct PlotApp {
-    sensor_data: Arc<Mutex<BTreeMap<u32, Vec<[f64; 2]>>>>,
-    running_averages: Arc<Mutex<BTreeMap<u32, RunningAverage>>>,
+    sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
     rx: mpsc::Receiver<Sample>,
+    zone_averages: Arc<Mutex<[exponential_average::ExponentialAverage; NUM_ZONES]>>,
+
+    midi_device: MidiOutputConnection
 }
 
 impl PlotApp {
     fn new(
-        sensor_data: Arc<Mutex<BTreeMap<u32, Vec<[f64; 2]>>>>,
-        running_averages: Arc<Mutex<BTreeMap<u32, RunningAverage>>>,
+        sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
         rx: mpsc::Receiver<Sample>,
+        zone_averages: Arc<Mutex<[exponential_average::ExponentialAverage; NUM_ZONES]>>,
     ) -> Self {
         Self {
             sensor_data,
-            running_averages,
             rx,
+            zone_averages,
+            midi_device: midi::create_midi_device().unwrap(),
         }
     }
 }
@@ -110,23 +91,27 @@ impl eframe::App for PlotApp {
         // Check for new data
         while let Ok(sample) = self.rx.try_recv() {
             let mut sensor_data = self.sensor_data.lock().unwrap();
-            let mut running_averages = self.running_averages.lock().unwrap();
+            let mut zone_averages = self.zone_averages.lock().unwrap();
+            let zone_index = sample.zone as usize;
 
-            let running_average = running_averages
-                .entry(sample.zone)
-                .or_insert_with(RunningAverage::new);
-
-            let avg = running_average.add(sample.value as f64);
-            let normalized_value = if avg != 0.0 {
-                (sample.value as f64 - avg) / avg
+            let normalized_value: f64;
+            if let Some(value) = sample.value {
+                zone_averages[zone_index].update(value as f64);
+                let average = zone_averages[zone_index].get_average().unwrap_or(0.0);
+                normalized_value = (value as f64 - average) / average;
+                // normalized_value = value as f64;
             } else {
-                0.0
-            };
+                normalized_value = 0.0;
+            }
 
-            //println!("{}, {}", sample.timestamp , sample.value);
+            let midi_control_value = f64::min(abs(normalized_value) * 20.0, 1.0);
+            let midi_control_value = f64::round(127.0 * midi_control_value) as u8;
+            let midi_control_channel = sample.zone as u8 + 41;
+            let _ = midi::send_control_change(&mut self.midi_device, midi_control_channel, midi_control_value);
 
-            let zone_data = sensor_data.entry(sample.zone).or_insert_with(Vec::new);
-            zone_data.push([sample.timestamp as f64, sample.value as f64]);
+            let zone_data = &mut sensor_data[zone_index];
+            //zone_data.push([sample.timestamp as f64, sample.value as f64]);
+            zone_data.push([sample.timestamp as f64 / 1000.0, normalized_value]);
 
             if zone_data.len() > MAX_POINTS {
                 zone_data.remove(0);
@@ -138,16 +123,13 @@ impl eframe::App for PlotApp {
 
             Plot::new("sensor_plot")
                 .legend(Legend::default())
-                // uv .allow_drag(false)
-                //.allow_zoom(false)
                 .allow_scroll(false)
+                .x_axis_label("Time (seconds)")
                 .show(ui, |plot_ui| {
-                    for (zone, points) in sensor_data.iter() {
-                        let plot_points = PlotPoints::new(points.clone()); // Simplified: PlotPoints can be created directly from Vec<[f64; 2]>
+                    for (zone, points) in sensor_data.iter().enumerate() {
+                        let plot_points = PlotPoints::new(points.clone());
                         plot_ui.line(Line::new(plot_points).name(format!("Zone {}", zone)));
                     }
-                    //plot_ui.set_plot_bounds(PlotBounds::from_min_max([0., 1.], [0., 100000.]));
-                    //plot_ui.set_auto_bounds([true, false].into());
                 });
         });
 
@@ -157,11 +139,9 @@ impl eframe::App for PlotApp {
 
 #[tokio::main]
 async fn main() -> Result<(), SampleError> {
-    let midi_conn = midi::create_midi_device().expect("Could not create MIDI device");
-
-    let sensor_data = Arc::new(Mutex::new(BTreeMap::new()));
-    let running_averages = Arc::new(Mutex::new(BTreeMap::new()));
-    let (tx, mut rx) = mpsc::channel(100);
+    let sensor_data = Arc::new(Mutex::new(Default::default()));
+    let (tx, rx) = mpsc::channel(100);
+    let zone_averages = Arc::new(Mutex::new([(); NUM_ZONES].map(|_| exponential_average::ExponentialAverage::new(EXPONENTIAL_ALPHA))));
 
     tokio::spawn(async move {
         println!("Starting");
@@ -214,9 +194,9 @@ async fn main() -> Result<(), SampleError> {
 
     let options = eframe::NativeOptions::default();
     eframe::run_native(
-        "BLE Sensor Data Plot (Normalized)",
+        "Dildonica Sensor Data Plot",
         options,
-        Box::new(|_cc| Ok(Box::new(PlotApp::new(sensor_data, running_averages, rx)))),
+        Box::new(|_cc| Ok(Box::new(PlotApp::new(sensor_data, rx, zone_averages)))),
     )
     .unwrap();
 
