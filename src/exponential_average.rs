@@ -1,3 +1,4 @@
+#[derive(Copy, Clone)]
 pub struct ExponentialAverage {
     alpha: f64,
     current_average: Option<f64>,

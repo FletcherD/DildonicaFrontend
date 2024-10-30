@@ -1,27 +1,30 @@
 mod midi;
 mod exponential_average;
 
-use std::cmp::min;
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints, Legend, PlotBounds};
+use egui_plot::{Line, Plot, PlotPoints, Legend, Corner, PlotBounds};
 use futures::stream::StreamExt;
 use thiserror::Error;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use eframe::egui::Vec2b;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use std::collections::{BTreeMap};
-use std::error::Error;
+use std::time::{Duration, Instant};
 use midir::MidiOutputConnection;
 use num_traits::abs;
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(0x64696c640000100080000000cafebabe);
 const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69630000100080000000cafebabe);
-const MAX_POINTS: usize = 100;
+const MAX_PLOT_POINTS: usize = 100;
+const PLOT_DURATION_SECS: f64 = 4.0;
 const NUM_ZONES: usize = 8;
-const EXPONENTIAL_ALPHA: f64 = 0.001;
+const EXPONENTIAL_ALPHA: f64 = 0.000;
+
+const ZONE_MAP: [usize; NUM_ZONES] = [3, 5, 7, 2, 4, 0, 1, 6];
+const MIDI_CONTROL_SLOPE: f64 = 20.0;
 
 #[derive(Error, Debug)]
 enum SampleError {
@@ -36,8 +39,8 @@ enum SampleError {
 #[derive(Clone, Copy)]
 struct Sample {
     timestamp: u32,
+    zone: usize,
     value: Option<u32>,
-    zone: u32,
 }
 
 impl Sample {
@@ -57,78 +60,102 @@ impl Sample {
         Ok(Sample {
             timestamp,
             value: if value == 0 { None } else { Some(value) },
-            zone,
+            zone: zone as usize,
         })
     }
 }
 
+#[derive(Clone, Copy)]
+struct SampleNormalized {
+    timestamp: u32,
+    zone: usize,
+    value_normalized: f64,
+}
+
+fn get_normalized_sample(sample: Sample, zone_averages: &mut [exponential_average::ExponentialAverage; NUM_ZONES]) -> SampleNormalized {
+    let zone = ZONE_MAP[sample.zone];
+    let value_normalized: f64;
+    if let Some(value) = sample.value {
+        zone_averages[zone].update(value as f64);
+        let average = zone_averages[zone].get_average().unwrap_or(0.0);
+        value_normalized = (value as f64 - average) / average;
+        // value_normalized = value as f64;
+    } else {
+        value_normalized = 0.0;
+    }
+    SampleNormalized {
+        zone,
+        timestamp: sample.timestamp,
+        value_normalized
+    }
+}
+
+fn send_midi_control_change(midi_device: &mut MidiOutputConnection, sample_normalized: SampleNormalized) {
+    let midi_control_value = f64::min(abs(sample_normalized.value_normalized) * MIDI_CONTROL_SLOPE, 1.0);
+    let midi_control_value = f64::round(127.0 * midi_control_value) as u8;
+    let midi_control_channel = sample_normalized.zone as u8 + 41;
+    let _ = midi::send_control_change(midi_device, midi_control_channel, midi_control_value);
+}
 
 struct PlotApp {
     sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
-    rx: mpsc::Receiver<Sample>,
-    zone_averages: Arc<Mutex<[exponential_average::ExponentialAverage; NUM_ZONES]>>,
-
-    midi_device: MidiOutputConnection
+    rx: mpsc::Receiver<SampleNormalized>,
+    time_begin: Instant,
+    time_delta: Option<u32>,
 }
 
 impl PlotApp {
     fn new(
         sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
-        rx: mpsc::Receiver<Sample>,
-        zone_averages: Arc<Mutex<[exponential_average::ExponentialAverage; NUM_ZONES]>>,
+        rx: mpsc::Receiver<SampleNormalized>,
     ) -> Self {
         Self {
             sensor_data,
             rx,
-            zone_averages,
-            midi_device: midi::create_midi_device().unwrap(),
+            time_begin: Instant::now(),
+            time_delta: None
         }
     }
 }
 
 impl eframe::App for PlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check for new data
-        while let Ok(sample) = self.rx.try_recv() {
-            let mut sensor_data = self.sensor_data.lock().unwrap();
-            let mut zone_averages = self.zone_averages.lock().unwrap();
-            let zone_index = sample.zone as usize;
+        let cur_machine_time = self.time_begin.elapsed().as_millis() as u32;
 
-            let normalized_value: f64;
-            if let Some(value) = sample.value {
-                zone_averages[zone_index].update(value as f64);
-                let average = zone_averages[zone_index].get_average().unwrap_or(0.0);
-                normalized_value = (value as f64 - average) / average;
-                // normalized_value = value as f64;
-            } else {
-                normalized_value = 0.0;
+        while let Ok(sample_normalized) = self.rx.try_recv() {
+            let timestamp = sample_normalized.timestamp;
+            println!("{:?}", timestamp);
+            if let None = self.time_delta {
+                self.time_delta = Some(cur_machine_time - timestamp);
             }
+            let mut sensor_data = self.sensor_data.lock().unwrap();
 
-            let midi_control_value = f64::min(abs(normalized_value) * 20.0, 1.0);
-            let midi_control_value = f64::round(127.0 * midi_control_value) as u8;
-            let midi_control_channel = sample.zone as u8 + 41;
-            let _ = midi::send_control_change(&mut self.midi_device, midi_control_channel, midi_control_value);
+            let midi_value = sample_normalized.value_normalized * MIDI_CONTROL_SLOPE * 127.0;
+            let zone_data = &mut sensor_data[sample_normalized.zone];
+            zone_data.push([timestamp as f64 / 1000.0, midi_value]);
 
-            let zone_data = &mut sensor_data[zone_index];
-            //zone_data.push([sample.timestamp as f64, sample.value as f64]);
-            zone_data.push([sample.timestamp as f64 / 1000.0, normalized_value]);
-
-            if zone_data.len() > MAX_POINTS {
+            if zone_data.len() > MAX_PLOT_POINTS {
                 zone_data.remove(0);
             }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let sensor_data = self.sensor_data.lock().unwrap();
+            let cur_dildonica_time = (cur_machine_time - self.time_delta.unwrap_or(0)) as f64 / 1000.0;
 
             Plot::new("sensor_plot")
-                .legend(Legend::default())
+                .legend(Legend::default().position(Corner::LeftTop))
                 .allow_scroll(false)
                 .x_axis_label("Time (seconds)")
                 .show(ui, |plot_ui| {
                     for (zone, points) in sensor_data.iter().enumerate() {
                         let plot_points = PlotPoints::new(points.clone());
                         plot_ui.line(Line::new(plot_points).name(format!("Zone {}", zone)));
+                        let mut plot_bounds = plot_ui.plot_bounds();
+                        plot_bounds.set_x(&PlotBounds::from_min_max(
+                            [cur_dildonica_time as f64 - PLOT_DURATION_SECS, 0.0], [cur_dildonica_time as f64, 0.0]));
+                        plot_ui.set_plot_bounds(plot_bounds);
+                        plot_ui.set_auto_bounds(Vec2b::new(false, true));
                     }
                 });
         });
@@ -141,7 +168,8 @@ impl eframe::App for PlotApp {
 async fn main() -> Result<(), SampleError> {
     let sensor_data = Arc::new(Mutex::new(Default::default()));
     let (tx, rx) = mpsc::channel(100);
-    let zone_averages = Arc::new(Mutex::new([(); NUM_ZONES].map(|_| exponential_average::ExponentialAverage::new(EXPONENTIAL_ALPHA))));
+    let mut zone_averages = [exponential_average::ExponentialAverage::new(EXPONENTIAL_ALPHA); NUM_ZONES];
+    let mut midi_device = midi::create_midi_device().unwrap();
 
     tokio::spawn(async move {
         println!("Starting");
@@ -182,7 +210,9 @@ async fn main() -> Result<(), SampleError> {
             while let Some(data) = notification_stream.next().await {
                 match Sample::from_bytes(&data.value) {
                     Ok(sample) => {
-                        tx.send(sample).await.unwrap();
+                        let sample_normalized = get_normalized_sample(sample, &mut zone_averages);
+                        send_midi_control_change(&mut midi_device, sample_normalized);
+                        tx.send(sample_normalized).await.unwrap();
                     }
                     Err(e) => eprintln!("Error parsing sensor data: {}", e)
                 };
@@ -196,7 +226,7 @@ async fn main() -> Result<(), SampleError> {
     eframe::run_native(
         "Dildonica Sensor Data Plot",
         options,
-        Box::new(|_cc| Ok(Box::new(PlotApp::new(sensor_data, rx, zone_averages)))),
+        Box::new(|_cc| Ok(Box::new(PlotApp::new(sensor_data, rx)))),
     )
     .unwrap();
 

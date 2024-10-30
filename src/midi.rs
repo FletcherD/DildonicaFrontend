@@ -28,7 +28,7 @@ pub fn create_midi_device() -> Result<MidiOutputConnection, Box<dyn Error>> {
     };
 
     println!("\nOpening connection");
-    let mut conn_out = midi_out.connect(out_port, "Dildonica MIDI")?;
+    let conn_out = midi_out.connect(out_port, "Dildonica MIDI")?;
     println!("Connection open. Listen to your virtual MIDI device.");
 
     Ok(conn_out)
