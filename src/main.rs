@@ -12,13 +12,12 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::Vec2b;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use midir::MidiOutputConnection;
 use num_traits::abs;
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(0x64696c640000100080000000cafebabe);
 const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69630000100080000000cafebabe);
-const MAX_PLOT_POINTS: usize = 100;
 const PLOT_DURATION_SECS: f64 = 4.0;
 const NUM_ZONES: usize = 8;
 const EXPONENTIAL_ALPHA: f64 = 0.000;
@@ -45,15 +44,15 @@ struct Sample {
 
 impl Sample {
     fn from_bytes(data: &[u8]) -> Result<Self, SampleError> {
-        if data.len() < 12 {
+        if data.len() < 9 {
             return Err(SampleError::DataTooShort);
         }
 
         let timestamp = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let value = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let zone = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let zone = u8::from_le_bytes(data[8..9].try_into().unwrap());
 
-        if zone >= NUM_ZONES as u32 {
+        if zone >= NUM_ZONES as u8 {
             return Err(SampleError::InvalidZone);
         }
 
@@ -121,10 +120,10 @@ impl PlotApp {
 impl eframe::App for PlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let cur_machine_time = self.time_begin.elapsed().as_millis() as u32;
+        let cur_dildonica_time = (cur_machine_time - self.time_delta.unwrap_or(0)) as f64 / 1000.0;
 
         while let Ok(sample_normalized) = self.rx.try_recv() {
             let timestamp = sample_normalized.timestamp;
-            println!("{:?}", timestamp);
             if let None = self.time_delta {
                 self.time_delta = Some(cur_machine_time - timestamp);
             }
@@ -134,14 +133,13 @@ impl eframe::App for PlotApp {
             let zone_data = &mut sensor_data[sample_normalized.zone];
             zone_data.push([timestamp as f64 / 1000.0, midi_value]);
 
-            if zone_data.len() > MAX_PLOT_POINTS {
+            while zone_data[0][0] < cur_dildonica_time as f64 - PLOT_DURATION_SECS {
                 zone_data.remove(0);
             }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let sensor_data = self.sensor_data.lock().unwrap();
-            let cur_dildonica_time = (cur_machine_time - self.time_delta.unwrap_or(0)) as f64 / 1000.0;
 
             Plot::new("sensor_plot")
                 .legend(Legend::default().position(Corner::LeftTop))
