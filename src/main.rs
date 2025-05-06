@@ -15,6 +15,7 @@ use uuid::Uuid;
 use std::time::Instant;
 use midir::MidiOutputConnection;
 use num_traits::abs;
+use clap::Parser;
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(0x64696c640000100080000000cafebabe);
 const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69630000100080000000cafebabe);
@@ -26,6 +27,15 @@ const ZONE_MAP: [usize; NUM_ZONES] = [0,1,2,3,4,5,6,7];
 const MIDI_CONTROL_SLOPE: f64 = 20.0;
 
 const MIDI_CONTROL_NUMBER: u8 = 41;
+
+/// Command line arguments
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Dildonica - BLE sensor to MIDI converter")]
+struct Args {
+    /// Run in headless mode (no GUI, only MIDI output)
+    #[arg(short = 'l', long)]
+    headless: bool,
+}
 
 #[derive(Error, Debug)]
 enum SampleError {
@@ -166,12 +176,16 @@ impl eframe::App for PlotApp {
 
 #[tokio::main]
 async fn main() -> Result<(), SampleError> {
+    // Parse command line arguments
+    let args = Args::parse();
+    
     let sensor_data = Arc::new(Mutex::new(Default::default()));
     let (tx, rx) = mpsc::channel(100);
     let mut zone_averages = [exponential_average::ExponentialAverage::new(EXPONENTIAL_ALPHA); NUM_ZONES];
     let mut midi_device = midi::create_midi_device().unwrap();
 
-    tokio::spawn(async move {
+    // Spawn BLE connection and data processing task
+    let ble_handle = tokio::spawn(async move {
         println!("Starting");
         let device_mac = "DB:96:90:70:68:A4";
 
@@ -225,13 +239,20 @@ async fn main() -> Result<(), SampleError> {
         }
     });
 
-    let options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "Dildonica Sensor Data Plot",
-        options,
-        Box::new(|_cc| Ok(Box::new(PlotApp::new(sensor_data, rx)))),
-    )
-    .unwrap();
+    // Run GUI if not in headless mode
+    if !args.headless {
+        let options = eframe::NativeOptions::default();
+        eframe::run_native(
+            "Dildonica Sensor Data Plot",
+            options,
+            Box::new(|_cc| Ok(Box::new(PlotApp::new(sensor_data, rx)))),
+        )
+        .unwrap();
+    } else {
+        println!("Running in headless mode (MIDI output only)");
+        // Keep the program running in headless mode
+        ble_handle.await.unwrap();
+    }
 
     Ok(())
 }
