@@ -39,9 +39,9 @@ enum SampleError {
 
 #[derive(Clone, Copy)]
 struct Sample {
-    timestamp: u32,
+    timestamp: i32,
     zone: usize,
-    value: Option<u32>,
+    value: Option<i32>,
 }
 
 impl Sample {
@@ -50,8 +50,8 @@ impl Sample {
             return Err(SampleError::DataTooShort);
         }
 
-        let timestamp = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        let value = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let timestamp = i32::from_le_bytes(data[0..4].try_into().unwrap());
+        let value = i32::from_le_bytes(data[4..8].try_into().unwrap());
         let zone = u8::from_le_bytes(data[8..9].try_into().unwrap());
 
         if zone >= NUM_ZONES as u8 {
@@ -68,7 +68,7 @@ impl Sample {
 
 #[derive(Clone, Copy)]
 struct SampleNormalized {
-    timestamp: u32,
+    timestamp: i32,
     zone: usize,
     value_normalized: f64,
 }
@@ -102,7 +102,7 @@ struct PlotApp {
     sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
     rx: mpsc::Receiver<SampleNormalized>,
     time_begin: Instant,
-    time_delta: Option<u32>,
+    time_delta: Option<i32>,
 }
 
 impl PlotApp {
@@ -121,7 +121,7 @@ impl PlotApp {
 
 impl eframe::App for PlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let cur_machine_time = self.time_begin.elapsed().as_millis() as u32;
+        let cur_machine_time = self.time_begin.elapsed().as_millis() as i32;
         let cur_dildonica_time = (cur_machine_time - self.time_delta.unwrap_or(0)) as f64 / 1000.0;
 
         while let Ok(sample_normalized) = self.rx.try_recv() {
@@ -212,7 +212,10 @@ async fn main() -> Result<(), SampleError> {
                     Ok(sample) => {
                         let sample_normalized = get_normalized_sample(sample, &mut zone_averages);
                         send_midi_control_change(&mut midi_device, sample_normalized);
-                        tx.send(sample_normalized).await.unwrap();
+                        if tx.send(sample_normalized).await.is_err() {
+                            println!("Exiting");
+                            break;
+                        }
                     }
                     Err(e) => eprintln!("Error parsing sensor data: {}", e)
                 };
@@ -232,4 +235,3 @@ async fn main() -> Result<(), SampleError> {
 
     Ok(())
 }
-
