@@ -22,8 +22,10 @@ const PLOT_DURATION_SECS: f64 = 4.0;
 const NUM_ZONES: usize = 8;
 const EXPONENTIAL_ALPHA: f64 = 0.000;
 
-const ZONE_MAP: [usize; NUM_ZONES] = [3, 5, 7, 2, 4, 0, 1, 6];
+const ZONE_MAP: [usize; NUM_ZONES] = [0,1,2,3,4,5,6,7];
 const MIDI_CONTROL_SLOPE: f64 = 20.0;
+
+const MIDI_CONTROL_NUMBER: u8 = 41;
 
 #[derive(Error, Debug)]
 enum SampleError {
@@ -92,7 +94,7 @@ fn get_normalized_sample(sample: Sample, zone_averages: &mut [exponential_averag
 fn send_midi_control_change(midi_device: &mut MidiOutputConnection, sample_normalized: SampleNormalized) {
     let midi_control_value = f64::min(abs(sample_normalized.value_normalized) * MIDI_CONTROL_SLOPE, 1.0);
     let midi_control_value = f64::round(127.0 * midi_control_value) as u8;
-    let midi_control_channel = sample_normalized.zone as u8 + 41;
+    let midi_control_channel = sample_normalized.zone as u8 + MIDI_CONTROL_NUMBER;
     let _ = midi::send_control_change(midi_device, midi_control_channel, midi_control_value);
 }
 
