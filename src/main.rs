@@ -1,31 +1,34 @@
-mod midi;
 mod exponential_average;
+mod midi;
 
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
+use clap::Parser;
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints, Legend, Corner, PlotBounds};
-use futures::stream::StreamExt;
-use thiserror::Error;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use eframe::egui::Vec2b;
-use tokio::sync::mpsc;
-use uuid::Uuid;
-use std::time::Instant;
+use egui_plot::{Corner, Legend, Line, Plot, PlotBounds, PlotPoints};
+use futures::stream::StreamExt;
 use midir::MidiOutputConnection;
 use num_traits::abs;
-use clap::Parser;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use thiserror::Error;
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(0x64696c640000100080000000cafebabe);
 const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69630000100080000000cafebabe);
+const DEVICE_MAC: &str = "DB:96:90:70:68:A4";
+
 const PLOT_DURATION_SECS: f64 = 4.0;
+
+const EXPONENTIAL_AVERAGE_ALPHA: f64 = 0.000;
+
 const NUM_ZONES: usize = 8;
-const EXPONENTIAL_ALPHA: f64 = 0.000;
+const ZONE_MAP: [usize; NUM_ZONES] = [0, 1, 2, 3, 4, 5, 6, 7];
 
-const ZONE_MAP: [usize; NUM_ZONES] = [0,1,2,3,4,5,6,7];
 const MIDI_CONTROL_SLOPE: f64 = 20.0;
-
 const MIDI_CONTROL_NUMBER: u8 = 41;
 
 /// Command line arguments
@@ -83,26 +86,35 @@ struct SampleNormalized {
     value_normalized: f64,
 }
 
-fn get_normalized_sample(sample: Sample, zone_averages: &mut [exponential_average::ExponentialAverage; NUM_ZONES]) -> SampleNormalized {
+fn get_normalized_sample(
+    sample: Sample,
+    zone_averages: &mut [exponential_average::ExponentialAverage; NUM_ZONES],
+) -> SampleNormalized {
     let zone = ZONE_MAP[sample.zone];
     let value_normalized: f64;
     if let Some(value) = sample.value {
         zone_averages[zone].update(value as f64);
         let average = zone_averages[zone].get_average().unwrap_or(0.0);
-        value_normalized = (value as f64 - average) / average;
-        // value_normalized = value as f64;
+        //value_normalized = (value as f64 - average) / average;
+        value_normalized = value as f64;
     } else {
         value_normalized = 0.0;
     }
     SampleNormalized {
         zone,
         timestamp: sample.timestamp,
-        value_normalized
+        value_normalized,
     }
 }
 
-fn send_midi_control_change(midi_device: &mut MidiOutputConnection, sample_normalized: SampleNormalized) {
-    let midi_control_value = f64::min(abs(sample_normalized.value_normalized) * MIDI_CONTROL_SLOPE, 1.0);
+fn send_midi_control_change(
+    midi_device: &mut MidiOutputConnection,
+    sample_normalized: SampleNormalized,
+) {
+    let midi_control_value = f64::min(
+        abs(sample_normalized.value_normalized) * MIDI_CONTROL_SLOPE,
+        1.0,
+    );
     let midi_control_value = f64::round(127.0 * midi_control_value) as u8;
     let midi_control_channel = sample_normalized.zone as u8 + MIDI_CONTROL_NUMBER;
     let _ = midi::send_control_change(midi_device, midi_control_channel, midi_control_value);
@@ -124,7 +136,7 @@ impl PlotApp {
             sensor_data,
             rx,
             time_begin: Instant::now(),
-            time_delta: None
+            time_delta: None,
         }
     }
 }
@@ -136,7 +148,7 @@ impl eframe::App for PlotApp {
 
         while let Ok(sample_normalized) = self.rx.try_recv() {
             let timestamp = sample_normalized.timestamp;
-            if let None = self.time_delta {
+            if self.time_delta == None {
                 self.time_delta = Some(cur_machine_time - timestamp);
             }
             let mut sensor_data = self.sensor_data.lock().unwrap();
@@ -145,7 +157,9 @@ impl eframe::App for PlotApp {
             let zone_data = &mut sensor_data[sample_normalized.zone];
             zone_data.push([timestamp as f64 / 1000.0, midi_value]);
 
-            while zone_data[0][0] < cur_dildonica_time as f64 - PLOT_DURATION_SECS {
+            while zone_data.len() != 0
+                && zone_data[0][0] < cur_dildonica_time as f64 - PLOT_DURATION_SECS
+            {
                 zone_data.remove(0);
             }
         }
@@ -163,7 +177,9 @@ impl eframe::App for PlotApp {
                         plot_ui.line(Line::new(plot_points).name(format!("Zone {}", zone)));
                         let mut plot_bounds = plot_ui.plot_bounds();
                         plot_bounds.set_x(&PlotBounds::from_min_max(
-                            [cur_dildonica_time as f64 - PLOT_DURATION_SECS, 0.0], [cur_dildonica_time as f64, 0.0]));
+                            [cur_dildonica_time as f64 - PLOT_DURATION_SECS, 0.0],
+                            [cur_dildonica_time as f64, 0.0],
+                        ));
                         plot_ui.set_plot_bounds(plot_bounds);
                         plot_ui.set_auto_bounds(Vec2b::new(false, true));
                     }
@@ -178,20 +194,23 @@ impl eframe::App for PlotApp {
 async fn main() -> Result<(), SampleError> {
     // Parse command line arguments
     let args = Args::parse();
-    
+
     let sensor_data = Arc::new(Mutex::new(Default::default()));
     let (tx, rx) = mpsc::channel(100);
-    let mut zone_averages = [exponential_average::ExponentialAverage::new(EXPONENTIAL_ALPHA); NUM_ZONES];
+    let mut zone_averages =
+        [exponential_average::ExponentialAverage::new(EXPONENTIAL_AVERAGE_ALPHA); NUM_ZONES];
     let mut midi_device = midi::create_midi_device().unwrap();
 
     // Spawn BLE connection and data processing task
     let ble_handle = tokio::spawn(async move {
         println!("Starting");
-        let device_mac = "DB:96:90:70:68:A4";
-
+        
         let manager = Manager::new().await.unwrap();
         let adapters = manager.adapters().await.unwrap();
-        let central = adapters.into_iter().next().expect("No Bluetooth adapters found");
+        let central = adapters
+            .into_iter()
+            .next()
+            .expect("No Bluetooth adapters found");
 
         central.start_scan(ScanFilter::default()).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -199,7 +218,7 @@ async fn main() -> Result<(), SampleError> {
         let peripherals = central.peripherals().await.unwrap();
         let device = peripherals
             .into_iter()
-            .find(|p| p.address().to_string() == device_mac)
+            .find(|p| p.address().to_string() == DEVICE_MAC)
             .expect("Device not found");
 
         println!("Connecting to device...");
@@ -231,7 +250,7 @@ async fn main() -> Result<(), SampleError> {
                             break;
                         }
                     }
-                    Err(e) => eprintln!("Error parsing sensor data: {}", e)
+                    Err(e) => eprintln!("Error parsing sensor data: {}", e),
                 };
             }
         } else {
