@@ -38,6 +38,9 @@ struct Args {
     /// Run in headless mode (no GUI, only MIDI output)
     #[arg(short = 'l', long)]
     headless: bool,
+    /// Plot raw sensor values instead of normalized values
+    #[arg(short, long)]
+    raw: bool,
 }
 
 #[derive(Error, Debug)]
@@ -80,61 +83,67 @@ impl Sample {
 }
 
 #[derive(Clone, Copy)]
-struct SampleNormalized {
+struct ProcessedSample {
     timestamp: i32,
     zone: usize,
+    value_raw: f64,
     value_normalized: f64,
 }
 
-fn get_normalized_sample(
+fn process_sample(
     sample: Sample,
     zone_averages: &mut [exponential_average::ExponentialAverage; NUM_ZONES],
-) -> SampleNormalized {
+) -> ProcessedSample {
     let zone = ZONE_MAP[sample.zone];
-    let value_normalized: f64;
-    if let Some(value) = sample.value {
-        zone_averages[zone].update(value as f64);
+    let (value_raw, value_normalized) = if let Some(value) = sample.value {
+        let raw = value as f64;
+        zone_averages[zone].update(raw);
         let average = zone_averages[zone].get_average().unwrap_or(0.0);
-        //value_normalized = (value as f64 - average) / average;
-        value_normalized = value as f64;
+        let normalized = (raw - average) / average;
+        (raw, normalized)
     } else {
-        value_normalized = 0.0;
-    }
-    SampleNormalized {
+        (0.0, 0.0)
+    };
+    
+    ProcessedSample {
         zone,
         timestamp: sample.timestamp,
+        value_raw,
         value_normalized,
     }
 }
 
 fn send_midi_control_change(
     midi_device: &mut MidiOutputConnection,
-    sample_normalized: SampleNormalized,
+    processed_sample: ProcessedSample,
 ) {
     let midi_control_value = f64::min(
-        abs(sample_normalized.value_normalized) * MIDI_CONTROL_SLOPE,
+        abs(processed_sample.value_normalized) * MIDI_CONTROL_SLOPE,
         1.0,
     );
     let midi_control_value = f64::round(127.0 * midi_control_value) as u8;
-    let midi_control_channel = sample_normalized.zone as u8 + MIDI_CONTROL_NUMBER;
+    let midi_control_channel = processed_sample.zone as u8 + MIDI_CONTROL_NUMBER;
     let _ = midi::send_control_change(midi_device, midi_control_channel, midi_control_value);
 }
 
 struct PlotApp {
     sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
-    rx: mpsc::Receiver<SampleNormalized>,
+    rx: mpsc::Receiver<ProcessedSample>,
     time_begin: Instant,
     time_delta: Option<i32>,
+    use_raw: bool,
 }
 
 impl PlotApp {
     fn new(
         sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
-        rx: mpsc::Receiver<SampleNormalized>,
+        rx: mpsc::Receiver<ProcessedSample>,
+        use_raw: bool,
     ) -> Self {
         Self {
             sensor_data,
             rx,
+            use_raw,
             time_begin: Instant::now(),
             time_delta: None,
         }
@@ -146,16 +155,24 @@ impl eframe::App for PlotApp {
         let cur_machine_time = self.time_begin.elapsed().as_millis() as i32;
         let cur_dildonica_time = (cur_machine_time - self.time_delta.unwrap_or(0)) as f64 / 1000.0;
 
-        while let Ok(sample_normalized) = self.rx.try_recv() {
-            let timestamp = sample_normalized.timestamp;
+        while let Ok(processed_sample) = self.rx.try_recv() {
+            let timestamp = processed_sample.timestamp;
             if self.time_delta == None {
                 self.time_delta = Some(cur_machine_time - timestamp);
             }
             let mut sensor_data = self.sensor_data.lock().unwrap();
 
-            let midi_value = sample_normalized.value_normalized * MIDI_CONTROL_SLOPE * 127.0;
-            let zone_data = &mut sensor_data[sample_normalized.zone];
-            zone_data.push([timestamp as f64 / 1000.0, midi_value]);
+            let plot_value = if self.use_raw {
+                processed_sample.value_raw
+            } else {
+                processed_sample.value_normalized
+            };
+            
+            let zone_data = &mut sensor_data[processed_sample.zone];
+            zone_data.push([
+                timestamp as f64 / 1000.0,
+                plot_value,
+            ]);
 
             while zone_data.len() != 0
                 && zone_data[0][0] < cur_dildonica_time as f64 - PLOT_DURATION_SECS
@@ -202,9 +219,10 @@ async fn main() -> Result<(), SampleError> {
     let mut midi_device = midi::create_midi_device().unwrap();
 
     // Spawn BLE connection and data processing task
+    let use_raw = args.raw;
     let ble_handle = tokio::spawn(async move {
         println!("Starting");
-        
+
         let manager = Manager::new().await.unwrap();
         let adapters = manager.adapters().await.unwrap();
         let central = adapters
@@ -243,9 +261,9 @@ async fn main() -> Result<(), SampleError> {
             while let Some(data) = notification_stream.next().await {
                 match Sample::from_bytes(&data.value) {
                     Ok(sample) => {
-                        let sample_normalized = get_normalized_sample(sample, &mut zone_averages);
-                        send_midi_control_change(&mut midi_device, sample_normalized);
-                        if tx.send(sample_normalized).await.is_err() {
+                        let processed_sample = process_sample(sample, &mut zone_averages);
+                        send_midi_control_change(&mut midi_device, processed_sample);
+                        if tx.send(processed_sample).await.is_err() {
                             println!("Exiting");
                             break;
                         }
@@ -264,7 +282,7 @@ async fn main() -> Result<(), SampleError> {
         eframe::run_native(
             "Dildonica Sensor Data Plot",
             options,
-            Box::new(|_cc| Ok(Box::new(PlotApp::new(sensor_data, rx)))),
+            Box::new(move |_cc| Ok(Box::new(PlotApp::new(sensor_data, rx, use_raw)))),
         )
         .unwrap();
     } else {
