@@ -41,6 +41,9 @@ struct Args {
     /// Plot raw sensor values instead of normalized values
     #[arg(short, long)]
     raw: bool,
+    /// Zone mapping (comma-separated list of 8 zone numbers, e.g., "5,6,7,2,1,3,4,0")
+    #[arg(short, long)]
+    map: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -51,6 +54,8 @@ enum SampleError {
     InvalidZone,
     #[error("BLE error: {0}")]
     BleError(#[from] btleplug::Error),
+    #[error("Invalid zone map: {0}")]
+    InvalidZoneMap(String),
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +87,46 @@ impl Sample {
     }
 }
 
+fn parse_zone_map(map_str: &str) -> Result<[usize; NUM_ZONES], SampleError> {
+    let parts: Vec<&str> = map_str.split(',').collect();
+    if parts.len() != NUM_ZONES {
+        return Err(SampleError::InvalidZoneMap(format!(
+            "Expected {} zones, got {}",
+            NUM_ZONES,
+            parts.len()
+        )));
+    }
+
+    let mut zone_map = [0; NUM_ZONES];
+    let mut used_zones = vec![false; NUM_ZONES];
+
+    for (i, part) in parts.iter().enumerate() {
+        let zone: usize = part.trim().parse().map_err(|_| {
+            SampleError::InvalidZoneMap(format!("Invalid zone number: '{}'", part))
+        })?;
+
+        if zone >= NUM_ZONES {
+            return Err(SampleError::InvalidZoneMap(format!(
+                "Zone {} is out of range (0-{})",
+                zone,
+                NUM_ZONES - 1
+            )));
+        }
+
+        if used_zones[zone] {
+            return Err(SampleError::InvalidZoneMap(format!(
+                "Zone {} is used multiple times",
+                zone
+            )));
+        }
+
+        zone_map[i] = zone;
+        used_zones[zone] = true;
+    }
+
+    Ok(zone_map)
+}
+
 #[derive(Clone, Copy)]
 struct ProcessedSample {
     timestamp: i32,
@@ -93,8 +138,10 @@ struct ProcessedSample {
 fn process_sample(
     sample: Sample,
     zone_averages: &mut [exponential_average::ExponentialAverage; NUM_ZONES],
+    zone_map: &[usize; NUM_ZONES],
 ) -> ProcessedSample {
-    let zone = ZONE_MAP[sample.zone];
+    // Find which output zone this device zone maps to
+    let zone = zone_map.iter().position(|&x| x == sample.zone).unwrap_or(sample.zone);
     let (value_raw, value_normalized) = if let Some(value) = sample.value {
         let raw = value as f64;
         zone_averages[zone].update(raw);
@@ -212,6 +259,13 @@ async fn main() -> Result<(), SampleError> {
     // Parse command line arguments
     let args = Args::parse();
 
+    // Parse zone mapping
+    let zone_map = if let Some(map_str) = &args.map {
+        parse_zone_map(map_str)?
+    } else {
+        ZONE_MAP // Use default mapping
+    };
+
     let sensor_data = Arc::new(Mutex::new(Default::default()));
     let (tx, rx) = mpsc::channel(100);
     let mut zone_averages =
@@ -220,6 +274,7 @@ async fn main() -> Result<(), SampleError> {
 
     // Spawn BLE connection and data processing task
     let use_raw = args.raw;
+    let zone_map_copy = zone_map;
     let ble_handle = tokio::spawn(async move {
         println!("Starting");
 
@@ -261,7 +316,7 @@ async fn main() -> Result<(), SampleError> {
             while let Some(data) = notification_stream.next().await {
                 match Sample::from_bytes(&data.value) {
                     Ok(sample) => {
-                        let processed_sample = process_sample(sample, &mut zone_averages);
+                        let processed_sample = process_sample(sample, &mut zone_averages, &zone_map_copy);
                         send_midi_control_change(&mut midi_device, processed_sample);
                         if tx.send(processed_sample).await.is_err() {
                             println!("Exiting");
