@@ -6,7 +6,10 @@ pub struct ExponentialAverage {
 
 impl ExponentialAverage {
     pub fn new(alpha: f64) -> Self {
-        assert!((0.0..=1.0).contains(&alpha), "Alpha must be between 0 and 1");
+        assert!(
+            (0.0..=1.0).contains(&alpha),
+            "Alpha must be between 0 and 1"
+        );
         ExponentialAverage {
             alpha,
             current_average: None,

@@ -19,14 +19,14 @@ use uuid::Uuid;
 
 const SERVICE_UUID: Uuid = Uuid::from_u128(0x64696c640000100080000000cafebabe);
 const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69630000100080000000cafebabe);
+const CONFIG_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69620000100080000000cafebabe);
 const DEVICE_MAC: &str = "DB:96:90:70:68:A4";
 
 const PLOT_DURATION_SECS: f64 = 4.0;
 
-const EXPONENTIAL_AVERAGE_ALPHA: f64 = 0.000;
+const EXPONENTIAL_AVERAGE_ALPHA: f64 = 0.001;
 
 const NUM_ZONES: usize = 8;
-const ZONE_MAP: [usize; NUM_ZONES] = [0, 1, 2, 3, 4, 5, 6, 7];
 
 const MIDI_CONTROL_SLOPE: f64 = 20.0;
 const MIDI_CONTROL_NUMBER: u8 = 41;
@@ -101,9 +101,10 @@ fn parse_zone_map(map_str: &str) -> Result<[usize; NUM_ZONES], SampleError> {
     let mut used_zones = vec![false; NUM_ZONES];
 
     for (i, part) in parts.iter().enumerate() {
-        let zone: usize = part.trim().parse().map_err(|_| {
-            SampleError::InvalidZoneMap(format!("Invalid zone number: '{}'", part))
-        })?;
+        let zone: usize = part
+            .trim()
+            .parse()
+            .map_err(|_| SampleError::InvalidZoneMap(format!("Invalid zone number: '{}'", part)))?;
 
         if zone >= NUM_ZONES {
             return Err(SampleError::InvalidZoneMap(format!(
@@ -135,13 +136,71 @@ struct ProcessedSample {
     value_normalized: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DildonicaZoneConfig {
+    enabled: bool,
+    midi_control: u8,
+    cycle_count_begin: u32,
+    cycle_count_end: u32,
+    comp_thresh_lo: u32,
+    comp_thresh_hi: u32,
+}
+
+impl Default for DildonicaZoneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            midi_control: 0,
+            cycle_count_begin: 1000,
+            cycle_count_end: 10000,
+            comp_thresh_lo: 100,
+            comp_thresh_hi: 4000,
+        }
+    }
+}
+
+impl DildonicaZoneConfig {
+    const SIZE: usize = 20; // 1 + 1 + 2 (padding) + 4 + 4 + 4 + 4 = 20 bytes (4-byte aligned)
+
+    fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut bytes = [0u8; Self::SIZE];
+        bytes[0] = self.enabled as u8;
+        bytes[1] = self.midi_control;
+        // bytes[2..4] are padding for 4-byte alignment
+        bytes[4..8].copy_from_slice(&self.cycle_count_begin.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.cycle_count_end.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.comp_thresh_lo.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.comp_thresh_hi.to_le_bytes());
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, SampleError> {
+        if bytes.len() < Self::SIZE {
+            return Err(SampleError::DataTooShort);
+        }
+
+        Ok(Self {
+            enabled: bytes[0] != 0,
+            midi_control: bytes[1],
+            // Skip bytes[2..4] (padding)
+            cycle_count_begin: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            cycle_count_end: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            comp_thresh_lo: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            comp_thresh_hi: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+        })
+    }
+}
+
 fn process_sample(
     sample: Sample,
     zone_averages: &mut [exponential_average::ExponentialAverage; NUM_ZONES],
     zone_map: &[usize; NUM_ZONES],
 ) -> ProcessedSample {
     // Find which output zone this device zone maps to
-    let zone = zone_map.iter().position(|&x| x == sample.zone).unwrap_or(sample.zone);
+    let zone = zone_map
+        .iter()
+        .position(|&x| x == sample.zone)
+        .unwrap_or(sample.zone);
     let (value_raw, value_normalized) = if let Some(value) = sample.value {
         let raw = value as f64;
         zone_averages[zone].update(raw);
@@ -151,7 +210,7 @@ fn process_sample(
     } else {
         (0.0, 0.0)
     };
-    
+
     ProcessedSample {
         zone,
         timestamp: sample.timestamp,
@@ -173,12 +232,59 @@ fn send_midi_control_change(
     let _ = midi::send_control_change(midi_device, midi_control_channel, midi_control_value);
 }
 
+async fn read_zone_configs(
+    device: &btleplug::platform::Peripheral,
+    config_char: &btleplug::api::Characteristic,
+) -> Result<[DildonicaZoneConfig; NUM_ZONES], SampleError> {
+    let data = device.read(config_char).await?;
+    let expected_size = DildonicaZoneConfig::SIZE * NUM_ZONES;
+
+    if data.len() != expected_size {
+        return Err(SampleError::DataTooShort);
+    }
+
+    let mut configs = [DildonicaZoneConfig::default(); NUM_ZONES];
+    for i in 0..NUM_ZONES {
+        let start = i * DildonicaZoneConfig::SIZE;
+        let end = start + DildonicaZoneConfig::SIZE;
+        configs[i] = DildonicaZoneConfig::from_bytes(&data[start..end])?;
+    }
+
+    Ok(configs)
+}
+
+async fn write_zone_configs(
+    device: &btleplug::platform::Peripheral,
+    config_char: &btleplug::api::Characteristic,
+    configs: &[DildonicaZoneConfig; NUM_ZONES],
+) -> Result<(), SampleError> {
+    let mut data = Vec::with_capacity(DildonicaZoneConfig::SIZE * NUM_ZONES);
+    for config in configs {
+        data.extend_from_slice(&config.to_bytes());
+    }
+
+    device
+        .write(config_char, &data, btleplug::api::WriteType::WithResponse)
+        .await?;
+    Ok(())
+}
+
+#[derive(PartialEq)]
+enum Tab {
+    Plot,
+    Config,
+}
+
 struct PlotApp {
     sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
     rx: mpsc::Receiver<ProcessedSample>,
     time_begin: Instant,
     time_delta: Option<i32>,
     use_raw: bool,
+    zone_configs: Arc<Mutex<[DildonicaZoneConfig; NUM_ZONES]>>,
+    config_tx: Option<mpsc::Sender<[DildonicaZoneConfig; NUM_ZONES]>>,
+    config_read_tx: Option<mpsc::Sender<()>>,
+    selected_tab: Tab,
 }
 
 impl PlotApp {
@@ -186,6 +292,9 @@ impl PlotApp {
         sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
         rx: mpsc::Receiver<ProcessedSample>,
         use_raw: bool,
+        zone_configs: Arc<Mutex<[DildonicaZoneConfig; NUM_ZONES]>>,
+        config_tx: mpsc::Sender<[DildonicaZoneConfig; NUM_ZONES]>,
+        config_read_tx: mpsc::Sender<()>,
     ) -> Self {
         Self {
             sensor_data,
@@ -193,6 +302,10 @@ impl PlotApp {
             use_raw,
             time_begin: Instant::now(),
             time_delta: None,
+            zone_configs,
+            config_tx: Some(config_tx),
+            config_read_tx: Some(config_read_tx),
+            selected_tab: Tab::Plot,
         }
     }
 }
@@ -214,12 +327,9 @@ impl eframe::App for PlotApp {
             } else {
                 processed_sample.value_normalized
             };
-            
+
             let zone_data = &mut sensor_data[processed_sample.zone];
-            zone_data.push([
-                timestamp as f64 / 1000.0,
-                plot_value,
-            ]);
+            zone_data.push([timestamp as f64 / 1000.0, plot_value]);
 
             while zone_data.len() != 0
                 && zone_data[0][0] < cur_dildonica_time as f64 - PLOT_DURATION_SECS
@@ -228,26 +338,117 @@ impl eframe::App for PlotApp {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let sensor_data = self.sensor_data.lock().unwrap();
+        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.selected_tab, Tab::Plot, "Plot");
+                ui.selectable_value(&mut self.selected_tab, Tab::Config, "Configuration");
+            });
+        });
 
-            Plot::new("sensor_plot")
-                .legend(Legend::default().position(Corner::LeftTop))
-                .allow_scroll(false)
-                .x_axis_label("Time (seconds)")
-                .show(ui, |plot_ui| {
-                    for (zone, points) in sensor_data.iter().enumerate() {
-                        let plot_points = PlotPoints::new(points.clone());
-                        plot_ui.line(Line::new(plot_points).name(format!("Zone {}", zone)));
-                        let mut plot_bounds = plot_ui.plot_bounds();
-                        plot_bounds.set_x(&PlotBounds::from_min_max(
-                            [cur_dildonica_time as f64 - PLOT_DURATION_SECS, 0.0],
-                            [cur_dildonica_time as f64, 0.0],
-                        ));
-                        plot_ui.set_plot_bounds(plot_bounds);
-                        plot_ui.set_auto_bounds(Vec2b::new(false, true));
+        egui::CentralPanel::default().show(ctx, |ui| match self.selected_tab {
+            Tab::Plot => {
+                let sensor_data = self.sensor_data.lock().unwrap();
+
+                Plot::new("sensor_plot")
+                    .legend(Legend::default().position(Corner::LeftTop))
+                    .allow_scroll(false)
+                    .x_axis_label("Time (seconds)")
+                    .show(ui, |plot_ui| {
+                        for (zone, points) in sensor_data.iter().enumerate() {
+                            let plot_points = PlotPoints::new(points.clone());
+                            plot_ui.line(Line::new(plot_points).name(format!("Zone {}", zone)));
+                            let mut plot_bounds = plot_ui.plot_bounds();
+                            plot_bounds.set_x(&PlotBounds::from_min_max(
+                                [cur_dildonica_time as f64 - PLOT_DURATION_SECS, 0.0],
+                                [cur_dildonica_time as f64, 0.0],
+                            ));
+                            plot_ui.set_plot_bounds(plot_bounds);
+                            plot_ui.set_auto_bounds(Vec2b::new(false, true));
+                        }
+                    });
+            }
+            Tab::Config => {
+                ui.heading("Zone Configuration");
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut configs = self.zone_configs.lock().unwrap();
+                    let mut config_changed = false;
+
+                    for (zone, config) in configs.iter_mut().enumerate() {
+                        ui.group(|ui| {
+                            ui.label(format!("Zone {}", zone));
+
+                            config_changed |= ui.checkbox(&mut config.enabled, "Enabled").changed();
+
+                            ui.horizontal(|ui| {
+                                ui.label("MIDI CC:");
+                                config_changed |= ui
+                                    .add(egui::Slider::new(&mut config.midi_control, 0..=127))
+                                    .changed();
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Cycle Count Begin:");
+                                config_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut config.cycle_count_begin)
+                                            .range(0..=100000),
+                                    )
+                                    .changed();
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Cycle Count End:");
+                                config_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut config.cycle_count_end)
+                                            .range(0..=100000),
+                                    )
+                                    .changed();
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Comparator Threshold Low:");
+                                config_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut config.comp_thresh_lo)
+                                            .range(0..=10000),
+                                    )
+                                    .changed();
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Comparator Threshold High:");
+                                config_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut config.comp_thresh_hi)
+                                            .range(0..=10000),
+                                    )
+                                    .changed();
+                            });
+                        });
+                        ui.separator();
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Read Config from Device").clicked() {
+                            if let Some(ref tx) = self.config_read_tx {
+                                let _ = tx.try_send(());
+                            }
+                        }
+                        
+                        if ui.button("Write Config to Device").clicked() {
+                            if let Some(ref tx) = self.config_tx {
+                                let _ = tx.try_send(*configs);
+                            }
+                        }
+                    });
+
+                    if config_changed {
+                        ctx.request_repaint();
                     }
                 });
+            }
         });
 
         ctx.request_repaint();
@@ -263,11 +464,14 @@ async fn main() -> Result<(), SampleError> {
     let zone_map = if let Some(map_str) = &args.map {
         parse_zone_map(map_str)?
     } else {
-        ZONE_MAP // Use default mapping
+        (0..NUM_ZONES).collect::<Vec<_>>().try_into().unwrap() // Use default mapping
     };
 
     let sensor_data = Arc::new(Mutex::new(Default::default()));
+    let zone_configs = Arc::new(Mutex::new([DildonicaZoneConfig::default(); NUM_ZONES]));
     let (tx, rx) = mpsc::channel(100);
+    let (config_tx, config_rx) = mpsc::channel::<[DildonicaZoneConfig; NUM_ZONES]>(10);
+    let (config_read_tx, config_read_rx) = mpsc::channel::<()>(10);
     let mut zone_averages =
         [exponential_average::ExponentialAverage::new(EXPONENTIAL_AVERAGE_ALPHA); NUM_ZONES];
     let mut midi_device = midi::create_midi_device().unwrap();
@@ -275,6 +479,7 @@ async fn main() -> Result<(), SampleError> {
     // Spawn BLE connection and data processing task
     let use_raw = args.raw;
     let zone_map_copy = zone_map;
+    let zone_configs_clone = zone_configs.clone();
     let ble_handle = tokio::spawn(async move {
         println!("Starting");
 
@@ -301,33 +506,83 @@ async fn main() -> Result<(), SampleError> {
         device.discover_services().await.unwrap();
 
         let chars = device.characteristics();
-        let char = chars
+        let sample_char = chars
             .iter()
             .find(|c| c.uuid == Uuid::from_str(&CHARACTERISTIC_UUID.to_string()).unwrap())
-            .expect("Characteristic not found");
+            .expect("Sample characteristic not found");
 
-        if char.properties.contains(CharPropFlags::NOTIFY) {
+        let config_char = chars
+            .iter()
+            .find(|c| c.uuid == Uuid::from_str(&CONFIG_CHARACTERISTIC_UUID.to_string()).unwrap())
+            .expect("Config characteristic not found");
+
+        // Read initial configuration
+        match read_zone_configs(&device, config_char).await {
+            Ok(configs) => {
+                println!("Read initial configuration from device");
+                *zone_configs_clone.lock().unwrap() = configs;
+            }
+            Err(e) => eprintln!("Failed to read initial configuration: {}", e),
+        }
+        
+        // Also trigger a read after startup
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match read_zone_configs(&device, config_char).await {
+            Ok(configs) => {
+                println!("Re-read configuration from device after startup");
+                *zone_configs_clone.lock().unwrap() = configs;
+            }
+            Err(e) => eprintln!("Failed to re-read configuration after startup: {}", e),
+        }
+
+        if sample_char.properties.contains(CharPropFlags::NOTIFY) {
             println!("Subscribing to notifications...");
-            device.subscribe(&char).await.unwrap();
+            device.subscribe(&sample_char).await.unwrap();
 
             let mut notification_stream = device.notifications().await.unwrap();
             println!("Listening for notifications...");
 
-            while let Some(data) = notification_stream.next().await {
-                match Sample::from_bytes(&data.value) {
-                    Ok(sample) => {
-                        let processed_sample = process_sample(sample, &mut zone_averages, &zone_map_copy);
-                        send_midi_control_change(&mut midi_device, processed_sample);
-                        if tx.send(processed_sample).await.is_err() {
-                            println!("Exiting");
-                            break;
+            let mut config_rx = config_rx;
+            let mut config_read_rx = config_read_rx;
+            loop {
+                tokio::select! {
+                    Some(data) = notification_stream.next() => {
+                        match Sample::from_bytes(&data.value) {
+                            Ok(sample) => {
+                                let processed_sample = process_sample(sample, &mut zone_averages, &zone_map_copy);
+                                send_midi_control_change(&mut midi_device, processed_sample);
+                                if tx.send(processed_sample).await.is_err() {
+                                    println!("Exiting");
+                                    break;
+                                }
+                            }
+                            Err(e) => eprintln!("Error parsing sensor data: {}", e),
+                        };
+                    }
+                    Some(new_configs) = config_rx.recv() => {
+                        println!("Writing new configuration to device...");
+                        match write_zone_configs(&device, config_char, &new_configs).await {
+                            Ok(()) => {
+                                println!("Configuration written successfully");
+                                *zone_configs_clone.lock().unwrap() = new_configs;
+                            }
+                            Err(e) => eprintln!("Failed to write configuration: {}", e),
                         }
                     }
-                    Err(e) => eprintln!("Error parsing sensor data: {}", e),
-                };
+                    Some(()) = config_read_rx.recv() => {
+                        println!("Reading configuration from device...");
+                        match read_zone_configs(&device, config_char).await {
+                            Ok(configs) => {
+                                println!("Configuration read successfully");
+                                *zone_configs_clone.lock().unwrap() = configs;
+                            }
+                            Err(e) => eprintln!("Failed to read configuration: {}", e),
+                        }
+                    }
+                }
             }
         } else {
-            println!("Characteristic does not support notifications");
+            println!("Sample characteristic does not support notifications");
         }
     });
 
@@ -337,7 +592,16 @@ async fn main() -> Result<(), SampleError> {
         eframe::run_native(
             "Dildonica Sensor Data Plot",
             options,
-            Box::new(move |_cc| Ok(Box::new(PlotApp::new(sensor_data, rx, use_raw)))),
+            Box::new(move |_cc| {
+                Ok(Box::new(PlotApp::new(
+                    sensor_data,
+                    rx,
+                    use_raw,
+                    zone_configs,
+                    config_tx,
+                    config_read_tx,
+                )))
+            }),
         )
         .unwrap();
     } else {
