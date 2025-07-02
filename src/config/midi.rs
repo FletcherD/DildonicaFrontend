@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MidiOutputMethod {
@@ -128,24 +126,5 @@ impl Default for MidiConfig {
                 scale: MusicalScale::Chromatic,
             },
         }
-    }
-}
-
-impl MidiConfig {
-    pub fn load_from_file_legacy() -> Self {
-        const LEGACY_CONFIG_FILE_NAME: &str = "dildonica_midi_config.json";
-        if Path::new(LEGACY_CONFIG_FILE_NAME).exists() {
-            match fs::read_to_string(LEGACY_CONFIG_FILE_NAME) {
-                Ok(json) => match serde_json::from_str(&json) {
-                    Ok(config) => {
-                        println!("Legacy MIDI config loaded from {}", LEGACY_CONFIG_FILE_NAME);
-                        return config;
-                    }
-                    Err(e) => eprintln!("Failed to parse legacy MIDI config file: {}", e),
-                },
-                Err(e) => eprintln!("Failed to read legacy MIDI config file: {}", e),
-            }
-        }
-        Self::default()
     }
 }

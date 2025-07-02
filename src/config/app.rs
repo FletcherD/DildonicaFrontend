@@ -8,6 +8,12 @@ use std::path::Path;
 pub struct AppConfig {
     pub midi: MidiConfig,
     pub plot_raw: bool,
+    pub zone_map: Vec<usize>,
+    pub exponential_alpha: f64,
+    pub plot_duration_secs: f64,
+}
+fn create_default_zone_map(num_zones: usize) -> Vec<usize> {
+    (0..num_zones).collect()
 }
 
 impl Default for AppConfig {
@@ -15,6 +21,9 @@ impl Default for AppConfig {
         Self {
             midi: MidiConfig::default(),
             plot_raw: false,
+            zone_map: create_default_zone_map(8), // Default to 8 zones
+            exponential_alpha: 0.001,
+            plot_duration_secs: 4.0,
         }
     }
 }
@@ -42,17 +51,6 @@ impl AppConfig {
                 Err(e) => eprintln!("Failed to read app config file: {}", e),
             }
         } else {
-            // Try loading legacy MIDI config file
-            if Path::new("dildonica_midi_config.json").exists() {
-                println!("Found legacy MIDI config, migrating to new format...");
-                let midi_config = MidiConfig::load_from_file_legacy();
-                let app_config = AppConfig {
-                    midi: midi_config,
-                    plot_raw: false,
-                };
-                let _ = app_config.save_to_file();
-                return app_config;
-            }
             println!("No app config file found, using defaults");
         }
         Self::default()

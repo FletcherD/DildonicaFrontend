@@ -7,9 +7,8 @@ use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanF
 use btleplug::platform::Manager;
 use clap::Parser;
 use config::{
-    create_default_zone_map, parse_zone_map, read_zone_configs, write_zone_configs,
+    read_zone_configs, write_zone_configs,
     AppConfig, DeviceConfigError, DildonicaZoneConfig,
-    ZoneMapError,
 };
 use gui::{PlotApp, ProcessedSample};
 use futures::stream::StreamExt;
@@ -25,7 +24,6 @@ const CONFIG_CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0x6f6e69620000100080000
 const DEVICE_MAC: &str = "DB:96:90:70:68:A4";
 
 
-const EXPONENTIAL_AVERAGE_ALPHA: f64 = 0.001;
 
 const NUM_ZONES: usize = 8;
 
@@ -36,9 +34,6 @@ struct Args {
     /// Run in headless mode (no GUI, only MIDI output)
     #[arg(short = 'l', long)]
     headless: bool,
-    /// Zone mapping (comma-separated list of 8 zone numbers, e.g., "5,6,7,2,1,3,4,0")
-    #[arg(short, long)]
-    map: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -49,8 +44,6 @@ enum SampleError {
     InvalidZone,
     #[error("BLE error: {0}")]
     BleError(#[from] btleplug::Error),
-    #[error("Zone map error: {0}")]
-    ZoneMapError(#[from] ZoneMapError),
     #[error("Device config error: {0}")]
     DeviceConfigError(#[from] DeviceConfigError),
 }
@@ -90,13 +83,16 @@ impl Sample {
 fn process_sample(
     sample: Sample,
     zone_averages: &mut [exponential_average::ExponentialAverage; NUM_ZONES],
-    zone_map: &[usize],
+    app_config: &Arc<Mutex<AppConfig>>,
 ) -> ProcessedSample {
     // Find which output zone this device zone maps to
-    let zone = zone_map
-        .iter()
-        .position(|&x| x == sample.zone)
-        .unwrap_or(sample.zone);
+    let zone = {
+        let config = app_config.lock().unwrap();
+        config.zone_map
+            .iter()
+            .position(|&x| x == sample.zone)
+            .unwrap_or(sample.zone)
+    };
     let (value_raw, value_normalized) = if let Some(value) = sample.value {
         let raw = value as f64;
         zone_averages[zone].update(raw);
@@ -123,26 +119,20 @@ async fn main() -> Result<(), SampleError> {
     // Parse command line arguments
     let args = Args::parse();
 
-    // Parse zone mapping
-    let zone_map = if let Some(map_str) = &args.map {
-        parse_zone_map(map_str, NUM_ZONES)?
-    } else {
-        create_default_zone_map(NUM_ZONES)
-    };
-
     let sensor_data = Arc::new(Mutex::new(Default::default()));
     let zone_configs = Arc::new(Mutex::new([DildonicaZoneConfig::default(); NUM_ZONES]));
     let app_config = Arc::new(Mutex::new(AppConfig::load_from_file()));
     let (tx, rx) = mpsc::channel(100);
     let (config_tx, config_rx) = mpsc::channel::<[DildonicaZoneConfig; NUM_ZONES]>(10);
     let (config_read_tx, config_read_rx) = mpsc::channel::<()>(10);
-    let mut zone_averages =
-        [exponential_average::ExponentialAverage::new(EXPONENTIAL_AVERAGE_ALPHA); NUM_ZONES];
+    let mut zone_averages = {
+        let config = app_config.lock().unwrap();
+        [exponential_average::ExponentialAverage::new(config.exponential_alpha); NUM_ZONES]
+    };
     let mut midi_device = midi::create_midi_device().unwrap();
     let mut midi_processor = midi::MidiProcessor::new();
 
     // Spawn BLE connection and data processing task
-    let zone_map_copy = zone_map;
     let zone_configs_clone = zone_configs.clone();
     let app_config_clone = app_config.clone();
     let ble_handle = tokio::spawn(async move {
@@ -216,7 +206,7 @@ async fn main() -> Result<(), SampleError> {
                     Some(data) = notification_stream.next() => {
                         match Sample::from_bytes(&data.value) {
                             Ok(sample) => {
-                                let processed_sample = process_sample(sample, &mut zone_averages, &zone_map_copy);
+                                let processed_sample = process_sample(sample, &mut zone_averages, &app_config_clone);
                                 {
                                     let app_config = app_config_clone.lock().unwrap();
                                     let _ = midi_processor.process_sample(&mut midi_device, processed_sample.zone, processed_sample.value_normalized, &app_config.midi);
