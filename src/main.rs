@@ -33,9 +33,6 @@ struct Args {
     /// Run in headless mode (no GUI, only MIDI output)
     #[arg(short = 'l', long)]
     headless: bool,
-    /// Plot raw sensor values instead of normalized values
-    #[arg(short, long)]
-    raw: bool,
     /// Zone mapping (comma-separated list of 8 zone numbers, e.g., "5,6,7,2,1,3,4,0")
     #[arg(short, long)]
     map: Option<String>,
@@ -263,11 +260,10 @@ struct PlotApp {
     rx: mpsc::Receiver<ProcessedSample>,
     time_begin: Instant,
     time_delta: Option<i32>,
-    use_raw: bool,
     zone_configs: Arc<Mutex<[DildonicaZoneConfig; NUM_ZONES]>>,
     config_tx: Option<mpsc::Sender<[DildonicaZoneConfig; NUM_ZONES]>>,
     config_read_tx: Option<mpsc::Sender<()>>,
-    midi_config: Arc<Mutex<midi::MidiConfig>>,
+    app_config: Arc<Mutex<midi::AppConfig>>,
     selected_tab: Tab,
 }
 
@@ -275,22 +271,20 @@ impl PlotApp {
     fn new(
         sensor_data: Arc<Mutex<[Vec<[f64; 2]>; NUM_ZONES]>>,
         rx: mpsc::Receiver<ProcessedSample>,
-        use_raw: bool,
         zone_configs: Arc<Mutex<[DildonicaZoneConfig; NUM_ZONES]>>,
         config_tx: mpsc::Sender<[DildonicaZoneConfig; NUM_ZONES]>,
         config_read_tx: mpsc::Sender<()>,
-        midi_config: Arc<Mutex<midi::MidiConfig>>,
+        app_config: Arc<Mutex<midi::AppConfig>>,
     ) -> Self {
         Self {
             sensor_data,
             rx,
-            use_raw,
             time_begin: Instant::now(),
             time_delta: None,
             zone_configs,
             config_tx: Some(config_tx),
             config_read_tx: Some(config_read_tx),
-            midi_config,
+            app_config,
             selected_tab: Tab::Plot,
         }
     }
@@ -308,11 +302,13 @@ impl eframe::App for PlotApp {
             }
             let mut sensor_data = self.sensor_data.lock().unwrap();
 
-            let plot_value = if self.use_raw {
+            let app_config = self.app_config.lock().unwrap();
+            let plot_value = if app_config.plot_raw {
                 processed_sample.value_raw
             } else {
                 processed_sample.value_normalized
             };
+            drop(app_config);
 
             let zone_data = &mut sensor_data[processed_sample.zone];
             zone_data.push([timestamp as f64 / 1000.0, plot_value]);
@@ -334,6 +330,22 @@ impl eframe::App for PlotApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.selected_tab {
             Tab::Plot => {
+                // Plot configuration controls
+                ui.horizontal(|ui| {
+                    let mut app_config = self.app_config.lock().unwrap();
+                    let config_changed = ui.checkbox(&mut app_config.plot_raw, "Show raw sensor values").changed();
+                    if config_changed {
+                        if let Err(e) = app_config.save_to_file() {
+                            eprintln!("Failed to save app config: {}", e);
+                        }
+                    }
+                    if !app_config.plot_raw {
+                        ui.label("(showing normalized values)");
+                    }
+                });
+
+                ui.separator();
+
                 let sensor_data = self.sensor_data.lock().unwrap();
 
                 Plot::new("sensor_plot")
@@ -440,33 +452,34 @@ impl eframe::App for PlotApp {
                 ui.heading("MIDI Configuration");
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut midi_config = self.midi_config.lock().unwrap();
+                    let mut app_config = self.app_config.lock().unwrap();
+                    let mut config_changed = false;
 
                     ui.group(|ui| {
                         ui.label("Output Method");
                         ui.horizontal(|ui| {
-                            ui.radio_value(&mut midi_config.method, midi::MidiOutputMethod::ControlChange, "Control Change Messages");
-                            ui.radio_value(&mut midi_config.method, midi::MidiOutputMethod::Notes, "Note On/Off Messages");
+                            config_changed |= ui.radio_value(&mut app_config.midi.method, midi::MidiOutputMethod::ControlChange, "Control Change Messages").changed();
+                            config_changed |= ui.radio_value(&mut app_config.midi.method, midi::MidiOutputMethod::Notes, "Note On/Off Messages").changed();
                         });
                     });
 
                     ui.separator();
 
-                    match midi_config.method {
+                    match app_config.midi.method {
                         midi::MidiOutputMethod::ControlChange => {
                             ui.group(|ui| {
                                 ui.label("Control Change Settings");
 
                                 ui.horizontal(|ui| {
                                     ui.label("Base Control Number:");
-                                    ui.add(egui::Slider::new(&mut midi_config.control_change_config.base_control_number, 0..=127));
+                                    config_changed |= ui.add(egui::Slider::new(&mut app_config.midi.control_change_config.base_control_number, 0..=127)).changed();
                                 });
 
                                 ui.horizontal(|ui| {
                                     ui.label("Control Slope:");
-                                    ui.add(egui::DragValue::new(&mut midi_config.control_change_config.control_slope)
+                                    config_changed |= ui.add(egui::DragValue::new(&mut app_config.midi.control_change_config.control_slope)
                                         .range(0.1..=100.0)
-                                        .speed(0.1));
+                                        .speed(0.1)).changed();
                                 });
 
                                 ui.label("Control Change mode sends MIDI CC messages for each zone.");
@@ -479,29 +492,52 @@ impl eframe::App for PlotApp {
 
                                 ui.horizontal(|ui| {
                                     ui.label("Base Note:");
-                                    ui.add(egui::Slider::new(&mut midi_config.note_config.base_note, 0..=127));
-                                    ui.label(format!("(MIDI note {})", midi_config.note_config.base_note));
+                                    config_changed |= ui.add(egui::Slider::new(&mut app_config.midi.note_config.base_note, 0..=127)).changed();
+                                    ui.label(format!("(MIDI note {})", app_config.midi.note_config.base_note));
                                 });
 
                                 ui.horizontal(|ui| {
                                     ui.label("Threshold:");
-                                    ui.add(egui::DragValue::new(&mut midi_config.note_config.threshold)
-                                        .range(0.01..=1.0)
-                                        .speed(0.01));
+                                    config_changed |= ui.add(egui::DragValue::new(&mut app_config.midi.note_config.threshold)
+                                        .range(0.001..=1.0)
+                                        .speed(0.001)).changed();
                                 });
 
                                 ui.horizontal(|ui| {
                                     ui.label("Velocity Slope:");
-                                    ui.add(egui::DragValue::new(&mut midi_config.note_config.velocity_slope)
-                                        .range(1.0..=500.0)
-                                        .speed(1.0));
+                                    config_changed |= ui.add(egui::DragValue::new(&mut app_config.midi.note_config.velocity_slope)
+                                        .range(1.0..=5000.0)
+                                        .speed(1.0)).changed();
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Musical Scale:");
+                                    config_changed |= egui::ComboBox::from_label("")
+                                        .selected_text(app_config.midi.note_config.scale.name())
+                                        .show_ui(ui, |ui| {
+                                            let mut scale_changed = false;
+                                            for scale in midi::MusicalScale::all_scales() {
+                                                scale_changed |= ui.selectable_value(&mut app_config.midi.note_config.scale, *scale, scale.name()).changed();
+                                            }
+                                            scale_changed
+                                        })
+                                        .inner
+                                        .unwrap_or(false);
                                 });
 
                                 ui.label("Note mode sends Note On when magnitude > threshold,");
                                 ui.label("Key Pressure while note is on, and Note Off when magnitude < threshold.");
-                                ui.label("Zone 0 uses base note, zone 1 uses base+1, etc.");
+                                ui.label("Zones are mapped to notes according to the selected musical scale.");
                             });
                         }
+                    }
+
+                    // Save config if any changes were made
+                    if config_changed {
+                        if let Err(e) = app_config.save_to_file() {
+                            eprintln!("Failed to save app config: {}", e);
+                        }
+                        ctx.request_repaint();
                     }
                 });
             }
@@ -525,7 +561,7 @@ async fn main() -> Result<(), SampleError> {
 
     let sensor_data = Arc::new(Mutex::new(Default::default()));
     let zone_configs = Arc::new(Mutex::new([DildonicaZoneConfig::default(); NUM_ZONES]));
-    let midi_config = Arc::new(Mutex::new(midi::MidiConfig::default()));
+    let app_config = Arc::new(Mutex::new(midi::AppConfig::load_from_file()));
     let (tx, rx) = mpsc::channel(100);
     let (config_tx, config_rx) = mpsc::channel::<[DildonicaZoneConfig; NUM_ZONES]>(10);
     let (config_read_tx, config_read_rx) = mpsc::channel::<()>(10);
@@ -535,10 +571,9 @@ async fn main() -> Result<(), SampleError> {
     let mut midi_processor = midi::MidiProcessor::new();
 
     // Spawn BLE connection and data processing task
-    let use_raw = args.raw;
     let zone_map_copy = zone_map;
     let zone_configs_clone = zone_configs.clone();
-    let midi_config_clone = midi_config.clone();
+    let app_config_clone = app_config.clone();
     let ble_handle = tokio::spawn(async move {
         println!("Starting");
 
@@ -610,8 +645,8 @@ async fn main() -> Result<(), SampleError> {
                             Ok(sample) => {
                                 let processed_sample = process_sample(sample, &mut zone_averages, &zone_map_copy);
                                 {
-                                    let midi_config = midi_config_clone.lock().unwrap();
-                                    let _ = midi_processor.process_sample(&mut midi_device, processed_sample.zone, processed_sample.value_normalized, &midi_config);
+                                    let app_config = app_config_clone.lock().unwrap();
+                                    let _ = midi_processor.process_sample(&mut midi_device, processed_sample.zone, processed_sample.value_normalized, &app_config.midi);
                                 }
                                 if tx.send(processed_sample).await.is_err() {
                                     println!("Exiting");
@@ -658,11 +693,10 @@ async fn main() -> Result<(), SampleError> {
                 Ok(Box::new(PlotApp::new(
                     sensor_data,
                     rx,
-                    use_raw,
                     zone_configs,
                     config_tx,
                     config_read_tx,
-                    midi_config,
+                    app_config,
                 )))
             }),
         )
