@@ -8,8 +8,6 @@ use eframe::egui;
 use eframe::egui::Vec2b;
 use egui_plot::{Corner, Legend, Line, Plot, PlotBounds, PlotPoints};
 use futures::stream::StreamExt;
-use midir::MidiOutputConnection;
-use num_traits::abs;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -27,9 +25,6 @@ const PLOT_DURATION_SECS: f64 = 4.0;
 const EXPONENTIAL_AVERAGE_ALPHA: f64 = 0.001;
 
 const NUM_ZONES: usize = 8;
-
-const MIDI_CONTROL_SLOPE: f64 = 20.0;
-const MIDI_CONTROL_NUMBER: u8 = 41;
 
 /// Command line arguments
 #[derive(Parser, Debug)]
@@ -219,19 +214,6 @@ fn process_sample(
     }
 }
 
-fn send_midi_control_change(
-    midi_device: &mut MidiOutputConnection,
-    processed_sample: ProcessedSample,
-) {
-    let midi_control_value = f64::min(
-        abs(processed_sample.value_normalized) * MIDI_CONTROL_SLOPE,
-        1.0,
-    );
-    let midi_control_value = f64::round(127.0 * midi_control_value) as u8;
-    let midi_control_channel = processed_sample.zone as u8 + MIDI_CONTROL_NUMBER;
-    let _ = midi::send_control_change(midi_device, midi_control_channel, midi_control_value);
-}
-
 async fn read_zone_configs(
     device: &btleplug::platform::Peripheral,
     config_char: &btleplug::api::Characteristic,
@@ -273,6 +255,7 @@ async fn write_zone_configs(
 enum Tab {
     Plot,
     Config,
+    Midi,
 }
 
 struct PlotApp {
@@ -284,6 +267,7 @@ struct PlotApp {
     zone_configs: Arc<Mutex<[DildonicaZoneConfig; NUM_ZONES]>>,
     config_tx: Option<mpsc::Sender<[DildonicaZoneConfig; NUM_ZONES]>>,
     config_read_tx: Option<mpsc::Sender<()>>,
+    midi_config: Arc<Mutex<midi::MidiConfig>>,
     selected_tab: Tab,
 }
 
@@ -295,6 +279,7 @@ impl PlotApp {
         zone_configs: Arc<Mutex<[DildonicaZoneConfig; NUM_ZONES]>>,
         config_tx: mpsc::Sender<[DildonicaZoneConfig; NUM_ZONES]>,
         config_read_tx: mpsc::Sender<()>,
+        midi_config: Arc<Mutex<midi::MidiConfig>>,
     ) -> Self {
         Self {
             sensor_data,
@@ -305,6 +290,7 @@ impl PlotApp {
             zone_configs,
             config_tx: Some(config_tx),
             config_read_tx: Some(config_read_tx),
+            midi_config,
             selected_tab: Tab::Plot,
         }
     }
@@ -342,6 +328,7 @@ impl eframe::App for PlotApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.selected_tab, Tab::Plot, "Plot");
                 ui.selectable_value(&mut self.selected_tab, Tab::Config, "Configuration");
+                ui.selectable_value(&mut self.selected_tab, Tab::Midi, "MIDI");
             });
         });
 
@@ -436,7 +423,7 @@ impl eframe::App for PlotApp {
                                 let _ = tx.try_send(());
                             }
                         }
-                        
+
                         if ui.button("Write Config to Device").clicked() {
                             if let Some(ref tx) = self.config_tx {
                                 let _ = tx.try_send(*configs);
@@ -446,6 +433,75 @@ impl eframe::App for PlotApp {
 
                     if config_changed {
                         ctx.request_repaint();
+                    }
+                });
+            }
+            Tab::Midi => {
+                ui.heading("MIDI Configuration");
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut midi_config = self.midi_config.lock().unwrap();
+
+                    ui.group(|ui| {
+                        ui.label("Output Method");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut midi_config.method, midi::MidiOutputMethod::ControlChange, "Control Change Messages");
+                            ui.radio_value(&mut midi_config.method, midi::MidiOutputMethod::Notes, "Note On/Off Messages");
+                        });
+                    });
+
+                    ui.separator();
+
+                    match midi_config.method {
+                        midi::MidiOutputMethod::ControlChange => {
+                            ui.group(|ui| {
+                                ui.label("Control Change Settings");
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Base Control Number:");
+                                    ui.add(egui::Slider::new(&mut midi_config.control_change_config.base_control_number, 0..=127));
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Control Slope:");
+                                    ui.add(egui::DragValue::new(&mut midi_config.control_change_config.control_slope)
+                                        .range(0.1..=100.0)
+                                        .speed(0.1));
+                                });
+
+                                ui.label("Control Change mode sends MIDI CC messages for each zone.");
+                                ui.label("Zone 0 uses base control number, zone 1 uses base+1, etc.");
+                            });
+                        }
+                        midi::MidiOutputMethod::Notes => {
+                            ui.group(|ui| {
+                                ui.label("Note Settings");
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Base Note:");
+                                    ui.add(egui::Slider::new(&mut midi_config.note_config.base_note, 0..=127));
+                                    ui.label(format!("(MIDI note {})", midi_config.note_config.base_note));
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Threshold:");
+                                    ui.add(egui::DragValue::new(&mut midi_config.note_config.threshold)
+                                        .range(0.01..=1.0)
+                                        .speed(0.01));
+                                });
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Velocity Slope:");
+                                    ui.add(egui::DragValue::new(&mut midi_config.note_config.velocity_slope)
+                                        .range(1.0..=500.0)
+                                        .speed(1.0));
+                                });
+
+                                ui.label("Note mode sends Note On when magnitude > threshold,");
+                                ui.label("Key Pressure while note is on, and Note Off when magnitude < threshold.");
+                                ui.label("Zone 0 uses base note, zone 1 uses base+1, etc.");
+                            });
+                        }
                     }
                 });
             }
@@ -469,17 +525,20 @@ async fn main() -> Result<(), SampleError> {
 
     let sensor_data = Arc::new(Mutex::new(Default::default()));
     let zone_configs = Arc::new(Mutex::new([DildonicaZoneConfig::default(); NUM_ZONES]));
+    let midi_config = Arc::new(Mutex::new(midi::MidiConfig::default()));
     let (tx, rx) = mpsc::channel(100);
     let (config_tx, config_rx) = mpsc::channel::<[DildonicaZoneConfig; NUM_ZONES]>(10);
     let (config_read_tx, config_read_rx) = mpsc::channel::<()>(10);
     let mut zone_averages =
         [exponential_average::ExponentialAverage::new(EXPONENTIAL_AVERAGE_ALPHA); NUM_ZONES];
     let mut midi_device = midi::create_midi_device().unwrap();
+    let mut midi_processor = midi::MidiProcessor::new();
 
     // Spawn BLE connection and data processing task
     let use_raw = args.raw;
     let zone_map_copy = zone_map;
     let zone_configs_clone = zone_configs.clone();
+    let midi_config_clone = midi_config.clone();
     let ble_handle = tokio::spawn(async move {
         println!("Starting");
 
@@ -524,7 +583,7 @@ async fn main() -> Result<(), SampleError> {
             }
             Err(e) => eprintln!("Failed to read initial configuration: {}", e),
         }
-        
+
         // Also trigger a read after startup
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         match read_zone_configs(&device, config_char).await {
@@ -550,7 +609,10 @@ async fn main() -> Result<(), SampleError> {
                         match Sample::from_bytes(&data.value) {
                             Ok(sample) => {
                                 let processed_sample = process_sample(sample, &mut zone_averages, &zone_map_copy);
-                                send_midi_control_change(&mut midi_device, processed_sample);
+                                {
+                                    let midi_config = midi_config_clone.lock().unwrap();
+                                    let _ = midi_processor.process_sample(&mut midi_device, processed_sample.zone, processed_sample.value_normalized, &midi_config);
+                                }
                                 if tx.send(processed_sample).await.is_err() {
                                     println!("Exiting");
                                     break;
@@ -600,6 +662,7 @@ async fn main() -> Result<(), SampleError> {
                     zone_configs,
                     config_tx,
                     config_read_tx,
+                    midi_config,
                 )))
             }),
         )
